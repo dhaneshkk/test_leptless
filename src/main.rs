@@ -1,50 +1,49 @@
-
-use std::path::{Path,PathBuf};
+use std::path::{Path, PathBuf};
 use std::env;
 use leptess::LepTess;
-use std::process::Command;
-use std::fs;
-use tempfile::TempDir;
-use anyhow::{Context,Result};
 
-/// Converts PDF to PNG images using pdftoppm.
+use tempfile::TempDir;
+use anyhow::{Context, Result};
+use rayon::prelude::*;
+
+// 1. Import the necessary items from pdfium-render
+use pdfium_render::prelude::*;
+
+/// Converts PDF to PNG images using the pdfium-render crate.
 /// Returns a tuple: (TempDir handle, Vec of image paths)
+// This is the new, parallelized version of your function.
 fn pdf_to_images(pdf_path: &Path) -> Result<(TempDir, Vec<PathBuf>)> {
     let temp_dir = TempDir::new().context("Failed to create temporary directory")?;
-    let output_prefix = temp_dir.path().join("page");
+    let pdfium = Pdfium::new(
+        Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./lib"))
+            .or_else(|_| Pdfium::bind_to_system_library())?,
+    );
+    let document = pdfium.load_pdf_from_file(pdf_path, None)
+        .context(format!("Failed to load PDF file: {}", pdf_path.display()))?;
 
-    // Convert PDF pages to PNG at 300 DPI
-    let status = Command::new("pdftoppm")
-        .arg("-png")
-        .arg("-r")
-        .arg("300")
-        .arg(pdf_path)
-        .arg(&output_prefix)
-        .status()
-        .context("Failed to execute pdftoppm")?;
+    // NOTE: Hardcoded rendering options from your example.
+    let render_config = PdfRenderConfig::new()
+        .set_maximum_width(3000); // Using DPI for better quality consistency
 
-    if !status.success() {
-        anyhow::bail!("pdftoppm failed with status: {}", status);
+    let mut image_paths = Vec::new();
+    for (i, page) in document.pages().iter().enumerate() {
+        let output_path = temp_dir.path().join(format!("page_{:04}.png", i + 1));
+        let image = page.render_with_config(&render_config)?.as_image();
+        image.save(&output_path)
+            .context(format!("Failed to save image for page {}", i + 1))?;
+        image_paths.push(output_path);
     }
-
-    // Collect generated PNGs
-    let mut images = Vec::new();
-    for entry in fs::read_dir(temp_dir.path()).context("Failed to read temp dir")? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map(|s| s == "png").unwrap_or(false) {
-            images.push(path);
-        }
-    }
-
-    images.sort(); // Ensure pages are in order
-    Ok((temp_dir, images))
+    Ok((temp_dir, image_paths))
 }
 
-/// Runs LepTess OCR on a single image
+
+/// Runs LepTess OCR on a single image.
+/// This function is thread-safe as it creates a new LepTess instance for each call.
 fn ocr_image(image_path: &Path) -> Result<String> {
+    // Each thread gets its own LepTess instance.
     let mut lt = LepTess::new(None, "eng").context("Failed to initialize LepTess")?;
-    let _=lt.set_image(image_path);
+    lt.set_image(image_path)
+        .context(format!("Failed to set image: {}", image_path.display()))?;
     let text = lt.get_utf8_text().context("Failed to get OCR text")?;
     Ok(text)
 }
@@ -62,15 +61,24 @@ fn main() -> Result<()> {
     println!("Processing PDF: {}", pdf_path.display());
 
     // Step 1: Convert PDF to images and keep TempDir alive
-    let (_temp_dir, images) = pdf_to_images(pdf_path).context("Failed to convert PDF to
-images")?;
+    let (_temp_dir, images) = pdf_to_images(pdf_path).context("Failed to convert PDF to images")?;
     println!("Converted PDF to {} image(s).", images.len());
 
-    // Step 2: OCR each page
-    for (i, image_path) in images.iter().enumerate() {
+    // Step 2: OCR each page in parallel using Rayon
+    println!("\n--- Starting OCR on {} pages in parallel ---", images.len());
+
+    let page_texts: Vec<Result<String>> = images
+        .par_iter()
+        .map(|image_path| ocr_image(image_path))
+        .collect();
+
+    // Step 3: Print the results sequentially to maintain page order
+    for (i, text_result) in page_texts.iter().enumerate() {
         println!("\n--- Page {} ---\n", i + 1);
-        let text = ocr_image(image_path).context("Failed to OCR page")?;
-        println!("{}", text);
+        match text_result {
+            Ok(text) => println!("{}", text),
+            Err(e) => eprintln!("Error processing page {}: {}", i + 1, e),
+        }
     }
     println!("\n--- End of Document ---");
     // TempDir is dropped here, cleaning up PNGs automatically
