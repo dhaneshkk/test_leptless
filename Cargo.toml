@@ -6,8 +6,8 @@ edition = "2021"
 
 [dependencies]
 leptess = "0.14"
-anyhow = "1.0"
+
 tempfile = "3.5"
 rayon = "1.10.0"
-pdfium-render = "0.8.18"
-image = "*"
+pdfium-render = "0.8.35"
+image = "0.25.6"
