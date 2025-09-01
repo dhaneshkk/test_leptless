@@ -19,45 +19,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/home/ubuntu/leptless/2021.eacl-main.75.pdf",
         None,
     )?;
-    let page_count = doc.pages().len() as usize;
+    let page_count = doc.pages().len();
     println!("Loaded PDF with {} pages", page_count);
 
     // ---- Open output file once ----
     let mut file = File::create("ocr_output.txt")?;
 
-    // ---- Process each page sequentially (low RAM) ----
-    for (index, page) in doc.pages().iter().enumerate() {
-        println!("---- Rendering Page {} ----", index + 1);
+    // ---- Init Tesseract once ----
+    let mut lt = LepTess::new(None, "eng")?;
 
-        // Render at ~300dpi
+    // ---- Process each page sequentially ----
+    for (index, page) in doc.pages().iter().enumerate() {
+        println!("---- Processing Page {} ----", index + 1);
+
+        // Try direct text extraction first
+        let extracted_text = page.text().unwrap().all();
+        if !extracted_text.trim().is_empty() {
+            writeln!(
+                file,
+                "\n\n===== Page {} (Extracted) =====\n\n{}",
+                index + 1,
+                extracted_text
+            )?;
+            println!("---- Text extracted from Page {} ----", index + 1);
+            continue;
+        }
+
+        // Otherwise, render page (at ~300dpi)
         let rendered = page.render_with_config(
             &PdfRenderConfig::new()
                 .set_target_width(2480)
                 .set_target_height(3508),
         )?;
-        let rgb_image = rendered.as_image().to_rgb8();
+        let gray_image = rendered.as_image().to_luma8();
 
-        // Encode to PNG in memory (only for OCR, not saved)
+        // Encode grayscale as PNG in memory for OCR
         let mut png_data: Vec<u8> = Vec::new();
         {
             let mut cursor = Cursor::new(&mut png_data);
             let encoder = PngEncoder::new(&mut cursor);
             encoder.write_image(
-                &rgb_image,
-                rgb_image.width(),
-                rgb_image.height(),
-                ExtendedColorType::from(ColorType::Rgb8),
+                &gray_image,
+                gray_image.width(),
+                gray_image.height(),
+                ExtendedColorType::from(ColorType::L8),
             )?;
         }
 
         // OCR
-        let mut lt = LepTess::new(None, "eng")?;
         lt.set_image_from_mem(&png_data)?;
-        let text = lt.get_utf8_text()?;
+        let ocr_text = lt.get_utf8_text()?;
 
-        // Write directly to disk (free RAM immediately after)
-        writeln!(file, "\n\n===== Page {} =====\n\n{}", index + 1, text)?;
-        println!("---- OCR Page {} complete and written ----", index + 1);
+        // Write OCR result
+        writeln!(
+            file,
+            "\n\n===== Page {} (OCR) =====\n\n{}",
+            index + 1,
+            ocr_text
+        )?;
+        println!("---- OCR complete for Page {} ----", index + 1);
     }
 
     println!("\n✅ OCR complete. Results saved to ocr_output.txt");
