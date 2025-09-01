@@ -1,21 +1,103 @@
-This Rust program performs Optical Character Recognition (OCR) on a PDF file by converting each page into an image and then extracting the text from that image. The extracted text from all pages is then saved into a single text file.
 
-Here's a breakdown of the code's functionality:
+# Multi-column  PDF OCR in Rust
 
-### Initialization and PDF Loading
-*   **PDFium Initialization**: The code begins by initializing the `pdfium-render` library, which is a Rust wrapper for the PDFium library used by Google Chrome to render PDF files. It first attempts to load the PDFium library from a local `./lib` directory and, if that fails, falls back to a system-wide installation.
-*   **Loading the PDF**: A specific PDF file, `/home/ubuntu/leptless/2021.eacl-main.75.pdf`, is loaded into memory. The program then prints the total number of pages in the document.
+`leptless` is a Rust tool that extracts text from PDF files using **Pdfium** for rendering pages and **Tesseract** for OCR. It analyzes the text layout to choose the best Tesseract Page Segmentation Mode (PSM) for improved OCR accuracy.
 
-### Page Processing Loop
-The program iterates through each page of the loaded PDF to perform the following actions sequentially, which helps in keeping memory usage low.
+## Features
 
-*   **Rendering**: Each page is rendered into an image with a resolution of 2480x3508 pixels (approximately 300 DPI for a standard A4 page), which is a good quality for OCR. The `pdfium-render` crate handles this conversion from a PDF page to a bitmap image.
-*   **Image Encoding**: The rendered bitmap is then encoded into the PNG format and stored in memory. This step is necessary because the OCR library, `leptess`, will work with this PNG data. The PNG image itself is not saved to a file.
-*   **Optical Character Recognition (OCR)**:
-    *   An instance of `LepTess` is created. `LepTess` is a high-level wrapper from the `leptess` crate, which provides bindings for the Tesseract OCR engine. The OCR engine is configured to use the English language model ("eng").
-    *   The in-memory PNG image data is passed to the `LepTess` instance.
-    *   The `get_utf8_text()` function is called to perform OCR and retrieve the recognized text.
-*   **Writing to File**: The extracted text from the page is written to a file named `ocr_output.txt`. Each page's text is clearly demarcated with a "===== Page X =====" header. This direct writing to disk after processing each page also contributes to efficient memory management.
+* Render PDFs to high-resolution images using Pdfium.
+* Automatically analyze text layout to determine single vs multi-column pages.
+* Use Tesseract for OCR with automatic PSM selection.
+* Supports multi-page PDF files.
+* Memory-efficient by processing page-by-page.
 
-### Completion
-Once all the pages have been processed, the program prints a completion message to the console, indicating that the OCR results have been saved to `ocr_output.txt`.
+## Requirements
+
+* Rust 1.70+ (or latest stable)
+* [Pdfium library](https://pdfium.googlesource.com/pdfium/) installed on your system
+* Tesseract OCR installed with English language data (`eng`)
+* `pkg-config` (for linking Pdfium)
+
+On Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install tesseract-ocr libtesseract-dev pkg-config
+```
+
+Pdfium can be installed via your package manager or built from source.
+
+## Installation
+
+1. Clone the repository:
+
+```bash
+git clone https://github.com/yourusername/leptless.git
+cd leptless
+```
+
+2. Build the project:
+
+```bash
+cargo build --release
+```
+
+## Usage
+
+Place your PDF in the project directory (e.g., `input.pdf`), then run:
+
+```bash
+cargo run
+```
+
+The program will process each page, analyze its layout, and print the OCR text:
+
+```
+--- Page 1 ---
+Text extracted from page 1...
+
+--- Page 2 ---
+Text extracted from page 2...
+```
+
+## How it Works
+
+1. **Pdfium** renders each PDF page to a high-resolution bitmap.
+2. The program analyzes character positions (`tight_bounds`) to estimate column layout.
+3. Based on the horizontal spread of text, the program selects a suitable **Tesseract PSM**:
+
+    * Wide single-block pages → `PsmSingleBlock`
+    * Multi-column pages → `PsmAutoOsd`
+4. **Tesseract** OCR runs on the rendered image, extracting text.
+
+## Determine multi-column
+
+```rust
+let mut tess = Tesseract::new(None, Some("eng"))?;
+if column_ratio > 0.8 {
+    tess.set_page_seg_mode(tesseract::PageSegMode::PsmSingleBlock);
+} else {
+    tess.set_page_seg_mode(tesseract::PageSegMode::PsmAutoOsd);
+}
+tess.set_image_from_mem(&buf)?;
+let text = tess.get_text()?;
+```
+### column-ratio calculation
+
+1.  **`page.width()`**: This method is called on the `PdfPage` object to get its width as a `PdfPoints` struct. We use `.value` to get the floating-point number representing the width.
+2.  **`page.text()?`**: This extracts a `PdfText` object, which provides access to the text content and character details.
+3.  **Initialization**: `min_x` is initialized to `f32::MAX` and `max_x` to `f32::MIN`. This ensures that the boundaries of the very first character processed will become the initial values for `min_x` and `max_x`.
+4.  **Character Iteration**: The code loops through every character on the page. For each one, `tight_bounds()` provides its precise location and size.
+5.  **Boundary Tracking**:
+    *   `min_x.min(bounds.left())` updates `min_x` if the current character is further to the left than any character seen before.
+    *   `max_x.max(bounds.left() + bounds.width())` calculates the right edge of the current character and updates `max_x` if this character extends further to the right.
+6.  **Ratio Calculation**: Finally, the width of the text block (`max_x - min_x`) is divided by the `page_width`. A check is included to handle pages with no text, preventing a division-by-zero or nonsensical result and correctly returning a ratio of `0.0`.
+## License
+
+MIT License. See `LICENSE` for details.
+
+---
+
+I can also create a **visual diagram for the workflow** for this README, which makes it clearer for new users.
+
+Do you want me to add that diagram?
