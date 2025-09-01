@@ -1,10 +1,13 @@
 use pdfium_render::prelude::*;
 use tesseract::Tesseract;
 use zspell::Dictionary;
- // new spelling library
-use image::{DynamicImage, Luma, ImageBuffer};
+use image::{DynamicImage, Luma, ImageBuffer, imageops};
 use std::io::Cursor;
 use std::fs;
+use image::GenericImageView;
+use  image::GenericImage;
+use image::Pixel;
+/// Calculate horizontal text spread on the page
 fn calculate_column_ratio(page: &PdfPage) -> Result<f32, PdfiumError> {
     let page_width = page.width().value;
     let text_page = page.text()?;
@@ -21,19 +24,17 @@ fn calculate_column_ratio(page: &PdfPage) -> Result<f32, PdfiumError> {
         }
     }
 
-    let column_ratio = if min_x <= max_x {
-        (max_x - min_x) / page_width
+    if min_x <= max_x {
+        Ok((max_x - min_x) / page_width)
     } else {
-        0.0
-    };
-
-    Ok(column_ratio)
+        Ok(0.0)
+    }
 }
 
-fn binarize_image(img: &DynamicImage) -> ImageBuffer<Luma<u8>, Vec<u8>> {
+/// Binarize image with a given threshold
+fn binarize_image(img: &DynamicImage, threshold: u8) -> ImageBuffer<Luma<u8>, Vec<u8>> {
     let gray = img.to_luma8();
     let mut binarized = gray.clone();
-    let threshold = 128u8;
 
     for (x, y, pixel) in gray.enumerate_pixels() {
         let Luma([l]) = *pixel;
@@ -44,6 +45,105 @@ fn binarize_image(img: &DynamicImage) -> ImageBuffer<Luma<u8>, Vec<u8>> {
     binarized
 }
 
+/// Enhance image by contrast adjustment and slight sharpening
+
+
+
+fn enhance_image(img: &DynamicImage) -> DynamicImage {
+    let mut enhanced = img.clone();
+
+    // Increase contrast
+    enhanced = image::DynamicImage::ImageRgba8(imageops::contrast(&enhanced, 20.0));
+
+    // Slight sharpening via unsharp mask
+    let blurred = imageops::blur(&enhanced, 1.0);
+    let (width, height) = enhanced.dimensions();
+
+    let mut sharpened = enhanced.clone();
+    for y in 0..height {
+        for x in 0..width {
+            let orig_pixel = enhanced.get_pixel(x, y);
+            let blur_pixel = blurred.get_pixel(x, y);
+
+            let new_pixel = orig_pixel.map2(&blur_pixel, |o, b| {
+                let val = o.saturating_add(o.saturating_sub(b)); // simple sharpening
+                val
+            });
+
+            sharpened.put_pixel(x, y, new_pixel);
+        }
+    }
+
+    sharpened
+}
+
+
+/// Perform OCR with adaptive thresholding and optional image enhancement
+fn ocr_with_retry(
+    img: &DynamicImage,
+    dict: &Dictionary,
+    column_ratio: f32,
+) -> anyhow::Result<String> {
+    // Try thresholds first
+    let thresholds = [180, 150, 128, 100, 70];
+
+    for &th in &thresholds {
+        let bin_img = binarize_image(img, th);
+        let mut buf = Vec::new();
+        DynamicImage::ImageLuma8(bin_img).write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)?;
+
+        let mut tess = Tesseract::new(None, Some("eng"))?;
+        if column_ratio > 0.8 {
+            tess.set_page_seg_mode(tesseract::PageSegMode::PsmSingleBlock);
+        } else {
+            tess.set_page_seg_mode(tesseract::PageSegMode::PsmAutoOsd);
+        }
+
+        tess = tess.set_image_from_mem(&buf)?;
+        let raw_text = tess.get_text()?;
+
+        let valid_words: Vec<String> = raw_text
+            .split_whitespace()
+            .filter(|w| dict.check(w))
+            .map(|s| s.to_string())
+            .collect();
+
+        if valid_words.len() >= 5 {
+            return Ok(valid_words.join(" "));
+        }
+    }
+
+    // Retry with enhanced image if thresholds failed
+    let enhanced_img = enhance_image(img);
+    for &th in &thresholds {
+        let bin_img = binarize_image(&enhanced_img, th);
+        let mut buf = Vec::new();
+        DynamicImage::ImageLuma8(bin_img).write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)?;
+
+        let mut tess = Tesseract::new(None, Some("eng"))?;
+        if column_ratio > 0.8 {
+            tess.set_page_seg_mode(tesseract::PageSegMode::PsmSingleBlock);
+        } else {
+            tess.set_page_seg_mode(tesseract::PageSegMode::PsmAutoOsd);
+        }
+
+        tess = tess.set_image_from_mem(&buf)?;
+        let raw_text = tess.get_text()?;
+
+        let valid_words: Vec<String> = raw_text
+            .split_whitespace()
+            .filter(|w| dict.check(w))
+            .map(|s| s.to_string())
+            .collect();
+
+        if valid_words.len() >= 5 {
+            return Ok(valid_words.join(" "));
+        }
+    }
+
+    Ok(String::from("[OCR failed: insufficient valid words]"))
+}
+
 fn main() -> anyhow::Result<()> {
     // Initialize Pdfium
     let bindings = Pdfium::bind_to_system_library()?;
@@ -52,19 +152,13 @@ fn main() -> anyhow::Result<()> {
     // Load PDF
     let doc = pdfium.load_pdf_from_file("/home/ubuntu/leptless/2021.eacl-main.75.pdf", None)?;
 
-    // Initialize zspell dictionary (English)
-   // This example just uses some shortened files. Load them to a string
-    let aff_content =
-        fs::read_to_string("index.aff").expect("failed to load config file");
-    let dic_content =
-        fs::read_to_string("index.dic").expect("failed to load wordlist file");
-
-    // Use the builder pattern to create our `Dictionary` object
+    // Load zspell dictionary
+    let aff_content = fs::read_to_string("index.aff")?;
+    let dic_content = fs::read_to_string("index.dic")?;
     let dict: Dictionary = zspell::builder()
         .config_str(&aff_content)
         .dict_str(&dic_content)
-        .build()
-        .expect("failed to build dictionary!");
+        .build()?;
 
     for (i, page) in doc.pages().iter().enumerate() {
         // Render high-res bitmap
@@ -77,38 +171,13 @@ fn main() -> anyhow::Result<()> {
         )?;
         let dyn_img: DynamicImage = bitmap.as_image();
 
-        // Adaptive binarization
-        let bin_img = binarize_image(&dyn_img);
-        let mut buf = Vec::new();
-        DynamicImage::ImageLuma8(bin_img).write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)?;
-
         // Calculate column ratio
         let column_ratio = calculate_column_ratio(&page)?;
         println!("--- Page {} ---", i + 1);
         println!("Column Ratio: {:.2}", column_ratio);
 
-        // Create new Tesseract per page
-        let mut tess = Tesseract::new(None, Some("eng"))?;
-
-        // Set PSM based on column layout
-        if column_ratio > 0.8 {
-            tess.set_page_seg_mode(tesseract::PageSegMode::PsmSingleBlock);
-        } else {
-            tess.set_page_seg_mode(tesseract::PageSegMode::PsmAutoOsd);
-        }
-
-        // Run OCR
-        tess= tess.set_image_from_mem(&buf)?;
-        let raw_text = tess.get_text()?;
-
-        // Filter words using zspell
-        let cleaned_text: Vec<String> = raw_text
-            .split_whitespace()
-            .filter(|w| dict.check(w))
-            .map(|s| s.to_string())
-            .collect();
-        let text = cleaned_text.join(" ");
-
+        // OCR with retries and enhancement
+        let text = ocr_with_retry(&dyn_img, &dict, column_ratio)?;
         println!("{}", text);
     }
 
