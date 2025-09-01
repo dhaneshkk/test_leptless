@@ -8,3 +8,5 @@ anyhow = "1"
 pdfium-render = "0.8"
 tesseract = "0.15"
 image = "0.25.7"
+
+zspell = "0.5.5"

@@ -1,36 +1,26 @@
 use pdfium_render::prelude::*;
 use tesseract::Tesseract;
+use zspell::Dictionary;
+ // new spelling library
+use image::{DynamicImage, Luma, ImageBuffer};
 use std::io::Cursor;
-use image::DynamicImage;
+use std::fs;
 fn calculate_column_ratio(page: &PdfPage) -> Result<f32, PdfiumError> {
-    // 1. Get the total width of the page in PDF "user space" points.
     let page_width = page.width().value;
-
-    // 2. Access the text content of the page.
     let text_page = page.text()?;
 
-    // 3. Initialize min and max horizontal coordinates.
-    //    We start with min_x at the largest possible value and max_x at the
-    //    smallest so that the first character's bounds will immediately replace them.
     let mut min_x = f32::MAX;
     let mut max_x = f32::MIN;
 
-    // 4. Iterate over every character on the page to find the text block's extent.
-    for character in text_page.chars().iter(){
-        // Get the tight bounding box for the character.
-        if let Ok(bounds) = character.tight_bounds() {
-            // Update the minimum x-coordinate found so far.
-            min_x = min_x.min(bounds.left().value);
-
-            // Update the maximum x-coordinate by finding the right edge of the character.
-            let right_edge = bounds.left() + bounds.width();
-            max_x = max_x.max(right_edge.value);
+    for ch in text_page.chars().iter() {
+        if let Ok(bounds) = ch.tight_bounds() {
+            let left = bounds.left().value;
+            let right = left + bounds.width().value;
+            min_x = min_x.min(left);
+            max_x = max_x.max(right);
         }
     }
 
-    // 5. Calculate the column ratio.
-    //    If min_x is still f32::MAX, it means no characters were found on the page.
-    //    In this case, the text width is zero, so the ratio should also be zero.
     let column_ratio = if min_x <= max_x {
         (max_x - min_x) / page_width
     } else {
@@ -39,14 +29,45 @@ fn calculate_column_ratio(page: &PdfPage) -> Result<f32, PdfiumError> {
 
     Ok(column_ratio)
 }
+
+fn binarize_image(img: &DynamicImage) -> ImageBuffer<Luma<u8>, Vec<u8>> {
+    let gray = img.to_luma8();
+    let mut binarized = gray.clone();
+    let threshold = 128u8;
+
+    for (x, y, pixel) in gray.enumerate_pixels() {
+        let Luma([l]) = *pixel;
+        let p = if l > threshold { 255 } else { 0 };
+        binarized.put_pixel(x, y, Luma([p]));
+    }
+
+    binarized
+}
+
 fn main() -> anyhow::Result<()> {
+    // Initialize Pdfium
     let bindings = Pdfium::bind_to_system_library()?;
     let pdfium = Pdfium::new(bindings);
 
+    // Load PDF
     let doc = pdfium.load_pdf_from_file("/home/ubuntu/leptless/2021.eacl-main.75.pdf", None)?;
 
+    // Initialize zspell dictionary (English)
+   // This example just uses some shortened files. Load them to a string
+    let aff_content =
+        fs::read_to_string("index.aff").expect("failed to load config file");
+    let dic_content =
+        fs::read_to_string("index.dic").expect("failed to load wordlist file");
+
+    // Use the builder pattern to create our `Dictionary` object
+    let dict: Dictionary = zspell::builder()
+        .config_str(&aff_content)
+        .dict_str(&dic_content)
+        .build()
+        .expect("failed to build dictionary!");
+
     for (i, page) in doc.pages().iter().enumerate() {
-        // Render page to high-resolution bitmap
+        // Render high-res bitmap
         let bitmap = page.render_with_config(
             &PdfRenderConfig::new()
                 .set_target_width(2000)
@@ -54,37 +75,40 @@ fn main() -> anyhow::Result<()> {
                 .rotate_if_landscape(PdfPageRenderRotation::None, false)
                 .render_form_data(true),
         )?;
-
         let dyn_img: DynamicImage = bitmap.as_image();
 
+        // Adaptive binarization
+        let bin_img = binarize_image(&dyn_img);
         let mut buf = Vec::new();
-        dyn_img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)?;
+        DynamicImage::ImageLuma8(bin_img).write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)?;
 
-        // Analyze page layout to decide PSM
-        let text_page = page.text()?;
+        // Calculate column ratio
         let column_ratio = calculate_column_ratio(&page)?;
         println!("--- Page {} ---", i + 1);
-        println!("Page Width: {:.2}", page.width());
-        println!("Column Ratio: {:.2}", column_ratio); // e.g., 0.85 for a full-width page
+        println!("Column Ratio: {:.2}", column_ratio);
 
-
-        // --- CORRECTED SECTION ---
-        // Create a new Tesseract instance per page and make it mutable
+        // Create new Tesseract per page
         let mut tess = Tesseract::new(None, Some("eng"))?;
-        println!("--- column_ratio {} ---", column_ratio);
-        // Set the PSM in-place
+
+        // Set PSM based on column layout
         if column_ratio > 0.8 {
             tess.set_page_seg_mode(tesseract::PageSegMode::PsmSingleBlock);
         } else {
             tess.set_page_seg_mode(tesseract::PageSegMode::PsmAutoOsd);
         }
 
-        // Now, set the image and get the text sequentially
-        let mut tess = tess.set_image_from_mem(&buf)?;
-        let text = tess.get_text()?;
-        // --- END CORRECTED SECTION ---
+        // Run OCR
+        tess= tess.set_image_from_mem(&buf)?;
+        let raw_text = tess.get_text()?;
 
-        println!("--- Page {} ---", i + 1);
+        // Filter words using zspell
+        let cleaned_text: Vec<String> = raw_text
+            .split_whitespace()
+            .filter(|w| dict.check(w))
+            .map(|s| s.to_string())
+            .collect();
+        let text = cleaned_text.join(" ");
+
         println!("{}", text);
     }
 
