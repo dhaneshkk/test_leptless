@@ -1,43 +1,46 @@
-use anyhow::Result;
-use image::{ImageBuffer, Luma};
-use leptess::LepTess;
-use pdfium_render::prelude::*; // Pdfium rendering
-use std::path::Path;
+use pdfium_render::prelude::*;
+use tesseract::Tesseract;
+use image;
+use std::io::Cursor;
 
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Initialize Pdfium (bind to system libpdfium)
     let bindings = Pdfium::bind_to_system_library()?;
     let pdfium = Pdfium::new(bindings);
-    // Bind to system-installed PDFium
 
+    // Load your PDF
     let doc = pdfium.load_pdf_from_file("/home/ubuntu/leptless/2021.eacl-main.75.pdf", None)?;
 
-    // Initialize Tesseract
-    let mut lt = LepTess::new(None, "eng")?;
-
-    // Loop through all pages
+    // Initialize Tesseract (English, assumes tessdata installed)
+    let mut tess = Tesseract::new(None, Some("eng"))?;
+    // Set PSM mode for multi-column handling
+    // Options: 1 (OSD+auto), 3 (auto), 4 (single col), 6 (single block), 11 (sparse), 12 (sparse+OSD)
+    tess = tess.set_variable("tessedit_pageseg_mode", "1")?;
+    // Process each page
     for (i, page) in doc.pages().iter().enumerate() {
-        // Render with auto-rotation
-        let rendered = page
-            .render_with_config(
-                &PdfRenderConfig::new()
-                    .set_target_width(2480)   // A4 ~300dpi
-                    .set_maximum_height(3508) // A4 ~300dpi
-                    .rotate_if_landscape(PdfPageRenderRotation::None, true),
-            )?
-            .as_image();
+        let render = page.render_with_config(
+            &PdfRenderConfig::new()
+                .set_target_width(2000) // high DPI for OCR quality
+                .set_maximum_height(2000)
+                .rotate_if_landscape(PdfPageRenderRotation::None,false)
+                .render_form_data(true),
+        );
 
-        // Convert to grayscale
-        let gray_image: ImageBuffer<Luma<u8>, Vec<u8>> = rendered.to_luma8();
+        // render_with_config returns Result<PdfBitmap, PdfiumError>
+        let bitmap = render?;
 
-        // Save for debugging
-        let filename = format!("page_{}.png", i + 1);
-        gray_image.save(&filename)?;
-        println!("Saved rendered page {}", filename);
+        // Convert Pdfium bitmap → DynamicImage
+        let dyn_img = bitmap.as_image();
 
-        // OCR
-        lt.set_image(&Path::new(&filename))?;
-        let text = lt.get_utf8_text()?;
-        println!("===== OCR Page {} =====", i + 1);
+        // Encode image as PNG in memory
+        let mut buf = Vec::new();
+        dyn_img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)?;
+
+        // OCR the image
+        tess = tess.set_image_from_mem(&buf)?;
+        let text = tess.get_text()?;
+
+        println!("--- Page {} ---", i + 1);
         println!("{}", text);
     }
 
