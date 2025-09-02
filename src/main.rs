@@ -153,8 +153,8 @@ fn main() -> anyhow::Result<()> {
     let doc = pdfium.load_pdf_from_file("/home/ubuntu/leptless/2021.eacl-main.75.pdf", None)?;
 
     // Load zspell dictionary
-    let aff_content = fs::read_to_string("index.aff")?;
-    let dic_content = fs::read_to_string("index.dic")?;
+    let aff_content = fs::read_to_string("en_US.aff")?;
+    let dic_content = fs::read_to_string("en_US.dic")?;
     let dict: Dictionary = zspell::builder()
         .config_str(&aff_content)
         .dict_str(&dic_content)
