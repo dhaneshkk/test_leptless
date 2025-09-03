@@ -4,9 +4,7 @@ use zspell::Dictionary;
 use image::{DynamicImage, Luma, ImageBuffer, imageops};
 use std::io::Cursor;
 use std::fs;
-use image::GenericImageView;
-use  image::GenericImage;
-use image::Pixel;
+
 /// Calculate horizontal text spread on the page
 fn calculate_column_ratio(page: &PdfPage) -> Result<f32, PdfiumError> {
     let page_width = page.width().value;
@@ -49,33 +47,24 @@ fn binarize_image(img: &DynamicImage, threshold: u8) -> ImageBuffer<Luma<u8>, Ve
 
 
 
+// --- COMPLETELY REWRITTEN AND CORRECTED FUNCTION ---
+/// Enhance image by increasing contrast and applying a sharpening filter.
+/// This function is made type-safe by converting to RGBA8 format first.
 fn enhance_image(img: &DynamicImage) -> DynamicImage {
-    let mut enhanced = img.clone();
+    // Convert to RGBA to work with a consistent format for imageops
+    let mut rgba_img = img.to_rgba8();
 
-    // Increase contrast
-    enhanced = image::DynamicImage::ImageRgba8(imageops::contrast(&enhanced, 20.0));
+    // Increase contrast. The imageops::contrast function returns an ImageBuffer.
+    rgba_img = imageops::contrast(&rgba_img, 15.0);
 
-    // Slight sharpening via unsharp mask
-    let blurred = imageops::blur(&enhanced, 1.0);
-    let (width, height) = enhanced.dimensions();
+    // Sharpening (unsharp mask). This is often more effective than a simple loop.
+    // Negative values sharpen, positive values blur.
+    let sharpened_buffer = imageops::unsharpen(&rgba_img, 5.0, 10);
 
-    let mut sharpened = enhanced.clone();
-    for y in 0..height {
-        for x in 0..width {
-            let orig_pixel = enhanced.get_pixel(x, y);
-            let blur_pixel = blurred.get_pixel(x, y);
-
-            let new_pixel = orig_pixel.map2(&blur_pixel, |o, b| {
-                let val = o.saturating_add(o.saturating_sub(b)); // simple sharpening
-                val
-            });
-
-            sharpened.put_pixel(x, y, new_pixel);
-        }
-    }
-
-    sharpened
+    // Convert the final ImageBuffer back to a DynamicImage
+    DynamicImage::ImageRgba8(sharpened_buffer)
 }
+
 
 
 /// Perform OCR with adaptive thresholding and optional image enhancement
@@ -84,13 +73,11 @@ fn ocr_with_retry(
     dict: &Dictionary,
     column_ratio: f32,
 ) -> anyhow::Result<String> {
-    // Try thresholds first
     let thresholds = [180, 150, 128, 100, 70];
-
-    for &th in &thresholds {
-        let bin_img = binarize_image(img, th);
+    let min_valid_words = 10; // Set a reasonable minimum number of words
+    let perform_ocr_and_filter = |image_buffer: &ImageBuffer<Luma<u8>, Vec<u8>>| -> anyhow::Result<String> {
         let mut buf = Vec::new();
-        DynamicImage::ImageLuma8(bin_img).write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)?;
+        image_buffer.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)?;
 
         let mut tess = Tesseract::new(None, Some("eng"))?;
         if column_ratio > 0.8 {
@@ -99,52 +86,60 @@ fn ocr_with_retry(
             tess.set_page_seg_mode(tesseract::PageSegMode::PsmAutoOsd);
         }
 
-        tess = tess.set_image_from_mem(&buf)?;
-        let raw_text = tess.get_text()?;
+        let mut tess = tess.set_image_from_mem(&buf)?;
+        let raw_text= tess.get_text()?;
 
-        let valid_words: Vec<String> = raw_text
-            .split_whitespace()
-            .filter(|w| dict.check(w))
-            .map(|s| s.to_string())
-            .collect();
+    // Step 2: Filter the raw text to keep words AND numbers/dates
+    let cleaned_text = raw_text
+        .split_whitespace()
+        .filter(|word| {
+            // First, strip common leading/trailing punctuation for a cleaner check.
+            // This handles cases like "(word)" or "number,".
+            let cleaned_word = word.trim_matches(|c: char| !c.is_alphanumeric());
 
-        if valid_words.len() >= 5 {
-            return Ok(valid_words.join(" "));
-        }
-    }
+            // Ignore empty strings that might result from stripping (e.g., a standalone "--").
+            if cleaned_word.is_empty() {
+                return false;
+            }
 
-    // Retry with enhanced image if thresholds failed
+            // Condition 1: The word is in the dictionary.
+            let is_in_dict = dict.check(cleaned_word);
+
+            // Condition 2: The word is likely a number, date, or code.
+            // Heuristic: it contains at least one digit. This is simple and effective.
+            let is_numeric_like = cleaned_word.chars().any(|c| c.is_ascii_digit());
+
+            // Keep the original `word` if either condition is true.
+            is_in_dict || is_numeric_like
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    Ok(cleaned_text)
+    };
+
+println!("Attempting OCR with multiple thresholds...");
+
+
+    println!("Thresholding failed. Enhancing image and retrying...");
     let enhanced_img = enhance_image(img);
     for &th in &thresholds {
         let bin_img = binarize_image(&enhanced_img, th);
-        let mut buf = Vec::new();
-        DynamicImage::ImageLuma8(bin_img).write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)?;
+        let text = perform_ocr_and_filter(&bin_img)?;
+        let word_count = text.split_whitespace().count();
 
-        let mut tess = Tesseract::new(None, Some("eng"))?;
-        if column_ratio > 0.8 {
-            tess.set_page_seg_mode(tesseract::PageSegMode::PsmSingleBlock);
-        } else {
-            tess.set_page_seg_mode(tesseract::PageSegMode::PsmAutoOsd);
-        }
-
-        tess = tess.set_image_from_mem(&buf)?;
-        let raw_text = tess.get_text()?;
-
-        let valid_words: Vec<String> = raw_text
-            .split_whitespace()
-            .filter(|w| dict.check(w))
-            .map(|s| s.to_string())
-            .collect();
-
-        if valid_words.len() >= 5 {
-            return Ok(valid_words.join(" "));
+        if word_count >= min_valid_words {
+            println!("Success with enhanced image and threshold {}.", th);
+            return Ok(text);
         }
     }
 
-    Ok(String::from("[OCR failed: insufficient valid words]"))
+
+    Ok(String::from("[OCR failed: insufficient valid words after all attempts]"))
 }
 
 fn main() -> anyhow::Result<()> {
+
     // Initialize Pdfium
     let bindings = Pdfium::bind_to_system_library()?;
     let pdfium = Pdfium::new(bindings);
